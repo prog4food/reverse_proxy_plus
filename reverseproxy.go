@@ -3,6 +3,7 @@
 // license that can be found in the LICENSE file.
 
 /* // mod by prog4food
+ + режим DenyConnUpgrade, который блокирует Upgrade соединения
  + режим Deep3XX, проходящий по 3XX запросам до указанной глубины
  + лимит размера проксируемого запроса и соотв ошибка err_ResponseOversize
  + возможность останавливать проксирование на этапе Director
@@ -101,6 +102,7 @@ type ReverseProxy struct {
 	ErrorHandler func(http.ResponseWriter, *http.Request, error)
 
 	Deep3XX uint8
+	DenyConnUpgrade bool
 	NoForwardedHeader bool
 	ResponseLimit int64
 }
@@ -281,18 +283,35 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	outreq.Close = false
 
-	reqUpType := upgradeType(outreq.Header)
-	if !ascii.IsPrint(reqUpType) {
-		p.getErrorHandler()(rw, req, fmt.Errorf("client tried to switch to invalid protocol %q", reqUpType))
-		return
-	}
-	removeConnectionHeaders(outreq.Header)
+	if !p.DenyConnUpgrade {
+		// Request: Normal mode
+		reqUpType := upgradeType(outreq.Header)
+		if !ascii.IsPrint(reqUpType) {
+			p.getErrorHandler()(rw, req, fmt.Errorf("client tried to switch to invalid protocol %q", reqUpType))
+			return
+		}
+		removeConnectionHeaders(outreq.Header)
 
-	// Remove hop-by-hop headers to the backend. Especially
-	// important is "Connection" because we want a persistent
-	// connection, regardless of what the client sent to us.
-	for _, h := range hopHeaders {
-		outreq.Header.Del(h)
+		// Remove hop-by-hop headers to the backend. Especially
+		// important is "Connection" because we want a persistent
+		// connection, regardless of what the client sent to us.
+		for _, h := range hopHeaders {
+			outreq.Header.Del(h)
+		}
+
+		// After stripping all the hop-by-hop connection headers above, add back any
+		// necessary for protocol upgrades, such as for websockets.
+		if reqUpType != "" {
+			outreq.Header.Set("Connection", "Upgrade")
+			outreq.Header.Set("Upgrade", reqUpType)
+		}
+	} else {
+		// Request: Deny Upgrade
+		removeConnectionHeaders(outreq.Header)
+
+		for _, h := range hopHeaders {
+			outreq.Header.Del(h)
+		}
 	}
 
 	// Issue 21096: tell backend applications that care about trailer support
@@ -302,13 +321,6 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// the latter has passed through removeConnectionHeaders.
 	if httpguts.HeaderValuesContainsToken(req.Header["Te"], "trailers") {
 		outreq.Header.Set("Te", "trailers")
-	}
-
-	// After stripping all the hop-by-hop connection headers above, add back any
-	// necessary for protocol upgrades, such as for websockets.
-	if reqUpType != "" {
-		outreq.Header.Set("Connection", "Upgrade")
-		outreq.Header.Set("Upgrade", reqUpType)
 	}
 
 	if !p.NoForwardedHeader {
@@ -367,13 +379,15 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// Deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
-	if res.StatusCode == http.StatusSwitchingProtocols {
-		if !p.modifyResponse(rw, res, outreq) {
+	if !p.DenyConnUpgrade {
+		// Deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
+		if res.StatusCode == http.StatusSwitchingProtocols {
+			if !p.modifyResponse(rw, res, outreq) {
+				return
+			}
+			p.handleUpgradeResponse(rw, outreq, res)
 			return
 		}
-		p.handleUpgradeResponse(rw, outreq, res)
-		return
 	}
 
 	removeConnectionHeaders(res.Header)
