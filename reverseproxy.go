@@ -2,9 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+/* // mod by prog4food
+*/
 // HTTP reverse proxy handler
 
-package httputil
+package reverse_proxy_plus
 
 import (
 	"context"
@@ -14,9 +16,9 @@ import (
 	"mime"
 	"net"
 	"net/http"
-	"net/http/internal/ascii"
 	"net/textproto"
 	"net/url"
+	"reverse_proxy_plus/internal/ascii"
 	"strings"
 	"sync"
 	"time"
