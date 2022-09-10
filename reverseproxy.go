@@ -3,6 +3,7 @@
 // license that can be found in the LICENSE file.
 
 /* // mod by prog4food
+ + режим Deep3XX, проходящий по 3XX запросам до указанной глубины
  + лимит размера проксируемого запроса и соотв ошибка err_ResponseOversize
  + возможность останавливать проксирование на этапе Director
  + отключение Forwarded заголовка через NoForwardedHeader
@@ -99,6 +100,7 @@ type ReverseProxy struct {
 	// a 502 Status Bad Gateway response.
 	ErrorHandler func(http.ResponseWriter, *http.Request, error)
 
+	Deep3XX uint8
 	NoForwardedHeader bool
 	ResponseLimit int64
 }
@@ -325,10 +327,44 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	res, err := transport.RoundTrip(outreq)
-	if err != nil {
-		p.getErrorHandler()(rw, outreq, err)
-		return
+	var (
+		res *http.Response
+		err error
+	)
+
+	// Follow redirects if Deep3XX > 0
+	R:
+	for i := uint8(0); i <= p.Deep3XX; i++ {
+		res, err = transport.RoundTrip(outreq)
+		if err != nil {
+			p.getErrorHandler()(rw, outreq, err)
+			return
+		}
+		if p.Deep3XX == 0 {
+			break R
+		} else {
+			switch res.StatusCode {
+				// https://stackoverflow.com/questions/16194988/for-which-3xx-http-codes-is-the-location-header-mandatory
+				case 300, 301, 302, 303, 307, 308:
+					loc := res.Header.Get("Location")
+					if loc == "" {
+						// While most 3xx responses include a Location, it is not
+						// required and 3xx responses without a Location have been
+						// observed in the wild. See issues #17773 and #49281.
+						p.logf("code 3xx, but Location header is empty")
+						break R
+					}
+					outreq.URL, err = req.URL.Parse(loc)
+					if err != nil {
+						p.logf("failed to parse Location header %q: %v", loc, err)
+						break R
+					}
+					outreq.Host = outreq.URL.Host
+					continue
+				default:
+					break R
+			}
+		}
 	}
 
 	// Deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
