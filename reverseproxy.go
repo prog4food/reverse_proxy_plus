@@ -3,6 +3,8 @@
 // license that can be found in the LICENSE file.
 
 /* // mod by prog4food
+Основные изменения:
+ + режим StrictRequests - проксирование только по WhiteList заголовкам
  + режим DenyConnUpgrade, который блокирует Upgrade соединения
  + режим Deep3XX, проходящий по 3XX запросам до указанной глубины
  + лимит размера проксируемого запроса и соотв ошибка err_ResponseOversize
@@ -104,6 +106,9 @@ type ReverseProxy struct {
 	Deep3XX uint8
 	DenyConnUpgrade bool
 	NoForwardedHeader bool
+
+	StrictRequests bool
+	StrictReqHeaderList []string
 	ResponseLimit int64
 }
 
@@ -312,6 +317,19 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		for _, h := range hopHeaders {
 			outreq.Header.Del(h)
 		}
+	}
+
+	if p.StrictRequests {
+		// Request: Strict mode
+		var whitelist_headers = make(http.Header)
+		var _head_val string
+		for _, h := range p.StrictReqHeaderList {
+			_head_val = outreq.Header.Get(h)
+			if _head_val != "" {
+				whitelist_headers.Add(h, _head_val)
+			}
+		}
+		outreq.Header = whitelist_headers
 	}
 
 	// Issue 21096: tell backend applications that care about trailer support
