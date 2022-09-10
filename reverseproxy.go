@@ -3,6 +3,7 @@
 // license that can be found in the LICENSE file.
 
 /* // mod by prog4food
+ + возможность останавливать проксирование на этапе Director
  + отключение Forwarded заголовка через NoForwardedHeader
 */
 // HTTP reverse proxy handler
@@ -50,7 +51,7 @@ type ReverseProxy struct {
 	// back to the original client unmodified.
 	// Director must not access the provided Request
 	// after returning.
-	Director func(*http.Request)
+	Director func(*http.Request) bool
 
 	// The transport used to perform proxy requests.
 	// If nil, http.DefaultTransport is used.
@@ -148,7 +149,7 @@ func joinURLPath(a, b *url.URL) (path, rawpath string) {
 // Director policy.
 func NewSingleHostReverseProxy(target *url.URL) *ReverseProxy {
 	targetQuery := target.RawQuery
-	director := func(req *http.Request) {
+	director := func(req *http.Request) bool {
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.URL.Path, req.URL.RawPath = joinURLPath(target, req.URL)
@@ -161,6 +162,7 @@ func NewSingleHostReverseProxy(target *url.URL) *ReverseProxy {
 			// explicitly disable User-Agent so it's not set to default value
 			req.Header.Set("User-Agent", "")
 		}
+		return true
 	}
 	return &ReverseProxy{Director: director}
 }
@@ -265,7 +267,9 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		outreq.Header = make(http.Header) // Issue 33142: historical behavior was to always allocate
 	}
 
-	p.Director(outreq)
+	if !p.Director(outreq) {
+		return
+	}
 	outreq.Close = false
 
 	reqUpType := upgradeType(outreq.Header)
