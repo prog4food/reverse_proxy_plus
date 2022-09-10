@@ -398,11 +398,10 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	var fb []byte // First bytes buffer
 	if !p.DenyConnUpgrade {
 		// Deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
 		if res.StatusCode == http.StatusSwitchingProtocols {
-			fb, err = p.modifyResponse(rw, res, outreq); if err != nil {
+			_, err = p.modifyResponse(rw, res, outreq); if err != nil {
 				return
 			}
 			p.handleUpgradeResponse(rw, outreq, res)
@@ -416,6 +415,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		res.Header.Del(h)
 	}
 
+	var fb []byte // First bytes buffer
 	fb, err = p.modifyResponse(rw, res, outreq); if err != nil {
 		return
 	}
@@ -437,8 +437,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// Write header first bytes first
 	if fb != nil {
-		_, err = rw.Write(fb)
-		if err != nil {
+		_, err = rw.Write(fb); if err != nil {
 			p.logf("first bytes write error: %v", err)
 		}
 	}
