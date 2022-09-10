@@ -6,6 +6,7 @@
 Основные изменения:
  + режим StrictRequests - проксирование только по WhiteList заголовкам
  + режим DenyConnUpgrade, который блокирует Upgrade соединения
+ + буфер fb (first bytes) который позволяет читать начало запроса для валидации данных
  + режим Deep3XX, проходящий по 3XX запросам до указанной глубины
  + лимит размера проксируемого запроса и соотв ошибка err_ResponseOversize
  + возможность останавливать проксирование на этапе Director
@@ -94,7 +95,7 @@ type ReverseProxy struct {
 	// If ModifyResponse returns an error, ErrorHandler is called
 	// with its error value. If ErrorHandler is nil, its default
 	// implementation is used.
-	ModifyResponse func(*http.Response) error
+	ModifyResponse func(*http.Response) ([]byte, error)
 
 	// ErrorHandler is an optional function that handles errors
 	// reaching the backend or errors from ModifyResponse.
@@ -222,16 +223,16 @@ func (p *ReverseProxy) getErrorHandler() func(http.ResponseWriter, *http.Request
 
 // modifyResponse conditionally runs the optional ModifyResponse hook
 // and reports whether the request should proceed.
-func (p *ReverseProxy) modifyResponse(rw http.ResponseWriter, res *http.Response, req *http.Request) bool {
+func (p *ReverseProxy) modifyResponse(rw http.ResponseWriter, res *http.Response, req *http.Request) ([]byte, error) {
 	if p.ModifyResponse == nil {
-		return true
+		return nil, nil
 	}
-	if err := p.ModifyResponse(res); err != nil {
+	fb, err := p.ModifyResponse(res); if err != nil {
 		res.Body.Close()
 		p.getErrorHandler()(rw, req, err)
-		return false
+		return nil, err
 	}
-	return true
+	return fb, nil
 }
 
 func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -397,10 +398,11 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	var fb []byte // First bytes buffer
 	if !p.DenyConnUpgrade {
 		// Deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
 		if res.StatusCode == http.StatusSwitchingProtocols {
-			if !p.modifyResponse(rw, res, outreq) {
+			fb, err = p.modifyResponse(rw, res, outreq); if err != nil {
 				return
 			}
 			p.handleUpgradeResponse(rw, outreq, res)
@@ -414,7 +416,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		res.Header.Del(h)
 	}
 
-	if !p.modifyResponse(rw, res, outreq) {
+	fb, err = p.modifyResponse(rw, res, outreq); if err != nil {
 		return
 	}
 
@@ -432,6 +434,14 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	rw.WriteHeader(res.StatusCode)
+
+	// Write header first bytes first
+	if fb != nil {
+		_, err = rw.Write(fb)
+		if err != nil {
+			p.logf("first bytes write error: %v", err)
+		}
+	}
 
 	err = p.copyResponse(rw, res.Body, p.flushInterval(res))
 	if err != nil {
