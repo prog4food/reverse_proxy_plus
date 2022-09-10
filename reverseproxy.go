@@ -3,6 +3,7 @@
 // license that can be found in the LICENSE file.
 
 /* // mod by prog4food
+ + лимит размера проксируемого запроса и соотв ошибка err_ResponseOversize
  + возможность останавливать проксирование на этапе Director
  + отключение Forwarded заголовка через NoForwardedHeader
 */
@@ -12,6 +13,7 @@ package reverse_proxy_plus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -98,7 +100,12 @@ type ReverseProxy struct {
 	ErrorHandler func(http.ResponseWriter, *http.Request, error)
 
 	NoForwardedHeader bool
+	ResponseLimit int64
 }
+
+var (
+	err_ResponseOversize = errors.New("Response oversize!")
+)
 
 // A BufferPool is an interface for getting and returning temporary
 // byte slices for use by io.CopyBuffer.
@@ -361,6 +368,10 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	err = p.copyResponse(rw, res.Body, p.flushInterval(res))
 	if err != nil {
 		defer res.Body.Close()
+		if err == err_ResponseOversize {
+			p.logf("response error: %v", err)
+			return
+		}
 		// Since we're streaming the response, if we run into an error all we can do
 		// is abort the request. Issue 23643: ReverseProxy should use ErrAbortHandler
 		// on read error while copying body.
@@ -489,6 +500,9 @@ func (p *ReverseProxy) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int
 			nw, werr := dst.Write(buf[:nr])
 			if nw > 0 {
 				written += int64(nw)
+				if p.ResponseLimit != 0 && p.ResponseLimit < written {
+					return written, err_ResponseOversize
+				}
 			}
 			if werr != nil {
 				return written, werr
