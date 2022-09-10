@@ -3,6 +3,7 @@
 // license that can be found in the LICENSE file.
 
 /* // mod by prog4food
+ + отключение Forwarded заголовка через NoForwardedHeader
 */
 // HTTP reverse proxy handler
 
@@ -94,6 +95,8 @@ type ReverseProxy struct {
 	// If nil, the default is to log the provided error and return
 	// a 502 Status Bad Gateway response.
 	ErrorHandler func(http.ResponseWriter, *http.Request, error)
+
+	NoForwardedHeader bool
 }
 
 // A BufferPool is an interface for getting and returning temporary
@@ -295,17 +298,19 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		outreq.Header.Set("Upgrade", reqUpType)
 	}
 
-	if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-		// If we aren't the first proxy retain prior
-		// X-Forwarded-For information as a comma+space
-		// separated list and fold multiple headers into one.
-		prior, ok := outreq.Header["X-Forwarded-For"]
-		omit := ok && prior == nil // Issue 38079: nil now means don't populate the header
-		if len(prior) > 0 {
-			clientIP = strings.Join(prior, ", ") + ", " + clientIP
-		}
-		if !omit {
-			outreq.Header.Set("X-Forwarded-For", clientIP)
+	if !p.NoForwardedHeader {
+		if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+			// If we aren't the first proxy retain prior
+			// X-Forwarded-For information as a comma+space
+			// separated list and fold multiple headers into one.
+			prior, ok := outreq.Header["X-Forwarded-For"]
+			omit := ok && prior == nil // Issue 38079: nil now means don't populate the header
+			if len(prior) > 0 {
+				clientIP = strings.Join(prior, ", ") + ", " + clientIP
+			}
+			if !omit {
+				outreq.Header.Set("X-Forwarded-For", clientIP)
+			}
 		}
 	}
 
