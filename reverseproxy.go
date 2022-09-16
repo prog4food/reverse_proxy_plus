@@ -27,7 +27,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
-	"reverse_proxy_plus/internal/ascii"
+	"github.com/prog4food/reverse_proxy_plus/internal/ascii"
 	"strings"
 	"sync"
 	"time"
