@@ -287,6 +287,9 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if !p.Director(outreq) {
 		return
 	}
+	if outreq.Form != nil {
+		outreq.URL.RawQuery = cleanQueryParams(outreq.URL.RawQuery)
+	}
 	outreq.Close = false
 
 	if !p.DenyConnUpgrade {
@@ -740,4 +743,37 @@ func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	_, err := io.Copy(c.backend, c.user)
 	errc <- err
+}
+
+func cleanQueryParams(s string) string {
+	reencode := func(s string) string {
+		v, _ := url.ParseQuery(s)
+		return v.Encode()
+	}
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case ';':
+			return reencode(s)
+		case '%':
+			if i+2 >= len(s) || !ishex(s[i+1]) || !ishex(s[i+2]) {
+				return reencode(s)
+			}
+			i += 3
+		default:
+			i++
+		}
+	}
+	return s
+}
+
+func ishex(c byte) bool {
+	switch {
+	case '0' <= c && c <= '9':
+		return true
+	case 'a' <= c && c <= 'f':
+		return true
+	case 'A' <= c && c <= 'F':
+		return true
+	}
+	return false
 }
