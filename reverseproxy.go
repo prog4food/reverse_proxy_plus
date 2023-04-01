@@ -11,6 +11,8 @@
  + лимит размера проксируемого запроса и соотв ошибка err_ResponseOversize
  + возможность останавливать проксирование на этапе Director
  + отключение Forwarded заголовка через NoForwardedHeader
+ + CleanQueryParams доступен глобально (для удаления неразбираемых параметров из запроса)
+ + RewriteRequestURL доступен глобально (для переиспользования в своем Director)
 */
 // HTTP reverse proxy handler
 
@@ -25,6 +27,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/textproto"
 	"net/url"
 	"github.com/prog4food/reverse_proxy_plus/internal/ascii"
@@ -39,18 +42,8 @@ import (
 // sends it to another server, proxying the response back to the
 // client.
 //
-// ReverseProxy by default sets the client IP as the value of the
-// X-Forwarded-For header.
-//
-// If an X-Forwarded-For header already exists, the client IP is
-// appended to the existing values. As a special case, if the header
-// exists in the Request.Header map but has a nil value (such as when
-// set by the Director func), the X-Forwarded-For header is
-// not modified.
-//
-// To prevent IP spoofing, be sure to delete any pre-existing
-// X-Forwarded-For header coming from the client or
-// an untrusted proxy.
+// 1xx responses are forwarded to the client if the underlying
+// transport supports ClientTrace.Got1xxResponse.
 type ReverseProxy struct {
 	// Director must be a function which modifies
 	// the request into a new request to be sent
@@ -58,6 +51,25 @@ type ReverseProxy struct {
 	// back to the original client unmodified.
 	// Director must not access the provided Request
 	// after returning.
+	//
+	// By default, the X-Forwarded-For header is set to the
+	// value of the client IP address. If an X-Forwarded-For
+	// header already exists, the client IP is appended to the
+	// existing values. As a special case, if the header
+	// exists in the Request.Header map but has a nil value
+	// (such as when set by the Director func), the X-Forwarded-For
+	// header is not modified.
+	//
+	// To prevent IP spoofing, be sure to delete any pre-existing
+	// X-Forwarded-For header coming from the client or
+	// an untrusted proxy.
+	//
+	// Hop-by-hop headers are removed from the request after
+	// Director returns, which can remove headers added by
+	// Director.
+	//
+	// Unparsable query parameters are removed from the outbound
+	// request if Request.Form is set after Director returns.
 	Director func(*http.Request) bool
 
 	// The transport used to perform proxy requests.
@@ -165,23 +177,25 @@ func joinURLPath(a, b *url.URL) (path, rawpath string) {
 // To rewrite Host headers, use ReverseProxy directly with a custom
 // Director policy.
 func NewSingleHostReverseProxy(target *url.URL) *ReverseProxy {
-	targetQuery := target.RawQuery
 	director := func(req *http.Request) bool {
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.URL.Path, req.URL.RawPath = joinURLPath(target, req.URL)
-		if targetQuery == "" || req.URL.RawQuery == "" {
-			req.URL.RawQuery = targetQuery + req.URL.RawQuery
-		} else {
-			req.URL.RawQuery = targetQuery + "&" + req.URL.RawQuery
-		}
-		if _, ok := req.Header["User-Agent"]; !ok {
-			// explicitly disable User-Agent so it's not set to default value
-			req.Header.Set("User-Agent", "")
-		}
+		RewriteRequestURL(req, target)
+		// NOTE: Перед последующим изменением запроса лучше удалить из него неразбираемые параметры
+		// req.URL.RawQuery = cleanQueryParams(req.URL.RawQuery)
 		return true
 	}
 	return &ReverseProxy{Director: director}
+}
+
+func RewriteRequestURL(req *http.Request, target *url.URL) {
+	targetQuery := target.RawQuery
+	req.URL.Scheme = target.Scheme
+	req.URL.Host = target.Host
+	req.URL.Path, req.URL.RawPath = joinURLPath(target, req.URL)
+	if targetQuery == "" || req.URL.RawQuery == "" {
+		req.URL.RawQuery = targetQuery + req.URL.RawQuery
+	} else {
+		req.URL.RawQuery = targetQuery + "&" + req.URL.RawQuery
+	}
 }
 
 func copyHeader(dst, src http.Header) {
@@ -288,7 +302,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if outreq.Form != nil {
-		outreq.URL.RawQuery = cleanQueryParams(outreq.URL.RawQuery)
+		outreq.URL.RawQuery = CleanQueryParams(outreq.URL.RawQuery)
 	}
 	outreq.Close = false
 
@@ -299,14 +313,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			p.getErrorHandler()(rw, req, fmt.Errorf("client tried to switch to invalid protocol %q", reqUpType))
 			return
 		}
-		removeConnectionHeaders(outreq.Header)
-
-		// Remove hop-by-hop headers to the backend. Especially
-		// important is "Connection" because we want a persistent
-		// connection, regardless of what the client sent to us.
-		for _, h := range hopHeaders {
-			outreq.Header.Del(h)
-		}
+		removeHopByHopHeaders(outreq.Header)
 
 		// After stripping all the hop-by-hop connection headers above, add back any
 		// necessary for protocol upgrades, such as for websockets.
@@ -316,11 +323,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	} else {
 		// Request: Deny Upgrade
-		removeConnectionHeaders(outreq.Header)
-
-		for _, h := range hopHeaders {
-			outreq.Header.Del(h)
-		}
+		removeHopByHopHeaders(outreq.Header)
 	}
 
 	if p.StrictRequests {
@@ -340,7 +343,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// that we support trailers. (We do, but we don't go out of our way to
 	// advertise that unless the incoming client request thought it was worth
 	// mentioning.) Note that we look at req.Header, not outreq.Header, since
-	// the latter has passed through removeConnectionHeaders.
+	// the latter has passed through removeHopByHopHeaders.
 	if httpguts.HeaderValuesContainsToken(req.Header["Te"], "trailers") {
 		outreq.Header.Set("Te", "trailers")
 	}
@@ -360,6 +363,28 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			}
 		}
 	}
+
+	if _, ok := outreq.Header["User-Agent"]; !ok {
+		// If the outbound request doesn't have a User-Agent header set,
+		// don't send the default Go HTTP client User-Agent.
+		outreq.Header.Set("User-Agent", "")
+	}
+
+	trace := &httptrace.ClientTrace{
+		Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
+			h := rw.Header()
+			copyHeader(h, http.Header(header))
+			rw.WriteHeader(code)
+
+			// Clear headers, it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses
+			for k := range h {
+				delete(h, k)
+			}
+
+			return nil
+		},
+	}
+	outreq = outreq.WithContext(httptrace.WithClientTrace(outreq.Context(), trace))
 
 	var (
 		res *http.Response
@@ -412,11 +437,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	removeConnectionHeaders(res.Header)
-
-	for _, h := range hopHeaders {
-		res.Header.Del(h)
-	}
+	removeHopByHopHeaders(res.Header)
 
 	var fb []byte // First bytes buffer
 	fb, err = p.modifyResponse(rw, res, outreq); if err != nil {
@@ -507,15 +528,21 @@ func shouldPanicOnCopyError(req *http.Request) bool {
 	return false
 }
 
-// removeConnectionHeaders removes hop-by-hop headers listed in the "Connection" header of h.
-// See RFC 7230, section 6.1
-func removeConnectionHeaders(h http.Header) {
+// removeHopByHopHeaders removes hop-by-hop headers.
+func removeHopByHopHeaders(h http.Header) {
+	// RFC 7230, section 6.1: Remove headers listed in the "Connection" header.
 	for _, f := range h["Connection"] {
 		for _, sf := range strings.Split(f, ",") {
 			if sf = textproto.TrimString(sf); sf != "" {
 				h.Del(sf)
 			}
 		}
+	}
+	// RFC 2616, section 13.5.1: Remove a set of known hop-by-hop headers.
+	// This behavior is superseded by the RFC 7230 Connection header, but
+	// preserve it for backwards compatibility.
+	for _, f := range hopHeaders {
+		h.Del(f)
 	}
 }
 
@@ -745,7 +772,7 @@ func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
 	errc <- err
 }
 
-func cleanQueryParams(s string) string {
+func CleanQueryParams(s string) string {
 	reencode := func(s string) string {
 		v, _ := url.ParseQuery(s)
 		return v.Encode()
