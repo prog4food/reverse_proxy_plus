@@ -130,7 +130,7 @@ var (
 )
 
 // A BufferPool is an interface for getting and returning temporary
-// byte slices for use by io.CopyBuffer.
+// byte slices for use by [io.CopyBuffer].
 type BufferPool interface {
 	Get() []byte
 	Put([]byte)
@@ -169,7 +169,7 @@ func joinURLPath(a, b *url.URL) (path, rawpath string) {
 	return a.Path + b.Path, apath + bpath
 }
 
-// NewSingleHostReverseProxy returns a new ReverseProxy that routes
+// NewSingleHostReverseProxy returns a new [ReverseProxy] that routes
 // URLs to the scheme, host, and base path provided in target. If the
 // target's path is "/base" and the incoming request was for "/dir",
 // the target request will be for /base/dir.
@@ -377,10 +377,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			rw.WriteHeader(code)
 
 			// Clear headers, it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses
-			for k := range h {
-				delete(h, k)
-			}
-
+			clear(h)
 			return nil
 		},
 	}
