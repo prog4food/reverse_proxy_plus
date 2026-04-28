@@ -423,7 +423,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 						p.logf("code 3xx, but Location header is empty")
 						break R
 					}
-					outreq.URL, err = req.URL.Parse(loc)
+					outreq.URL, err = outreq.URL.Parse(loc)
 					if err != nil {
 						p.logf("failed to parse Location header %q: %v", loc, err)
 						break R
