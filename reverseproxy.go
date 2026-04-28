@@ -10,7 +10,7 @@
  + режим Deep3XX, проходящий по 3XX запросам до указанной глубины
  + лимит размера проксируемого запроса и соотв ошибка err_ResponseOversize
  + возможность останавливать проксирование на этапе Director
- + отключение Forwarded заголовка через NoForwardedHeader
+ + отключение Forwarded заголовков через Rewrite (при отключенном StrictRequests)
  + CleanQueryParams доступен глобально (для удаления неразбираемых параметров из запроса)
  + RewriteRequestURL доступен глобально (для переиспользования в своем Director)
 */
@@ -33,10 +33,81 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
 )
+
+// A ProxyRequest contains a request to be rewritten by a [ReverseProxy].
+type ProxyRequest struct {
+	// In is the request received by the proxy.
+	// The Rewrite function must not modify In.
+	In *http.Request
+
+	// Out is the request which will be sent by the proxy.
+	// The Rewrite function may modify or replace this request.
+	// Hop-by-hop headers are removed from this request
+	// before Rewrite is called.
+	Out *http.Request
+}
+
+// SetURL routes the outbound request to the scheme, host, and base path
+// provided in target. If the target's path is "/base" and the incoming
+// request was for "/dir", the target request will be for "/base/dir".
+// To route requests without joining the incoming path,
+// set r.Out.URL directly.
+//
+// SetURL rewrites the outbound Host header to match the target's host.
+// To preserve the inbound request's Host header (the default behavior
+// of [NewSingleHostReverseProxy]):
+//
+//	rewriteFunc := func(r *httputil.ProxyRequest) {
+//		r.SetURL(url)
+//		r.Out.Host = r.In.Host
+//	}
+func (r *ProxyRequest) SetURL(target *url.URL) {
+	RewriteRequestURL(r.Out, target)
+	r.Out.Host = ""
+}
+
+// SetXForwarded sets the X-Forwarded-For, X-Forwarded-Host, and
+// X-Forwarded-Proto headers of the outbound request.
+//
+//   - The X-Forwarded-For header is set to the client IP address.
+//   - The X-Forwarded-Host header is set to the host name requested
+//     by the client.
+//   - The X-Forwarded-Proto header is set to "http" or "https", depending
+//     on whether the inbound request was made on a TLS-enabled connection.
+//
+// If the outbound request contains an existing X-Forwarded-For header,
+// SetXForwarded appends the client IP address to it. To append to the
+// inbound request's X-Forwarded-For header (the default behavior of
+// [ReverseProxy] when using a Director function), copy the header
+// from the inbound request before calling SetXForwarded:
+//
+//	rewriteFunc := func(r *httputil.ProxyRequest) {
+//		r.Out.Header["X-Forwarded-For"] = r.In.Header["X-Forwarded-For"]
+//		r.SetXForwarded()
+//	}
+func (r *ProxyRequest) SetXForwarded() {
+	clientIP, _, err := net.SplitHostPort(r.In.RemoteAddr)
+	if err == nil {
+		prior := r.Out.Header["X-Forwarded-For"]
+		if len(prior) > 0 {
+			clientIP = strings.Join(prior, ", ") + ", " + clientIP
+		}
+		r.Out.Header.Set("X-Forwarded-For", clientIP)
+	} else {
+		r.Out.Header.Del("X-Forwarded-For")
+	}
+	r.Out.Header.Set("X-Forwarded-Host", r.In.Host)
+	if r.In.TLS == nil {
+		r.Out.Header.Set("X-Forwarded-Proto", "http")
+	} else {
+		r.Out.Header.Set("X-Forwarded-Proto", "https")
+	}
+}
 
 // ReverseProxy is an HTTP Handler that takes an incoming request and
 // sends it to another server, proxying the response back to the
@@ -44,33 +115,36 @@ import (
 //
 // 1xx responses are forwarded to the client if the underlying
 // transport supports ClientTrace.Got1xxResponse.
+//
+// Hop-by-hop headers (see RFC 9110, section 7.6.1), including
+// Connection, Proxy-Connection, Keep-Alive, Proxy-Authenticate,
+// Proxy-Authorization, TE, Trailer, Transfer-Encoding, and Upgrade,
+// are removed from client requests and backend responses.
+// The Rewrite function may be used to add hop-by-hop headers to the request,
+// and the ModifyResponse function may be used to remove them from the response.
 type ReverseProxy struct {
-	// Director must be a function which modifies
+	// Rewrite must be a function which modifies
 	// the request into a new request to be sent
 	// using Transport. Its response is then copied
 	// back to the original client unmodified.
-	// Director must not access the provided Request
-	// after returning.
+	// Rewrite must not access the provided ProxyRequest
+	// or its contents after returning.
 	//
-	// By default, the X-Forwarded-For header is set to the
-	// value of the client IP address. If an X-Forwarded-For
-	// header already exists, the client IP is appended to the
-	// existing values. As a special case, if the header
-	// exists in the Request.Header map but has a nil value
-	// (such as when set by the Director func), the X-Forwarded-For
-	// header is not modified.
+	// The Forwarded, X-Forwarded, X-Forwarded-Host,
+	// and X-Forwarded-Proto headers are removed from the
+	// outbound request before Rewrite is called. See also
+	// the ProxyRequest.SetXForwarded method.
 	//
-	// To prevent IP spoofing, be sure to delete any pre-existing
-	// X-Forwarded-For header coming from the client or
-	// an untrusted proxy.
+	// Unparsable query parameters are removed from the
+	// outbound request before Rewrite is called.
+	// The Rewrite function may copy the inbound URL's
+	// RawQuery to the outbound URL to preserve the original
+	// parameter string. Note that this can lead to security
+	// issues if the proxy's interpretation of query parameters
+	// does not match that of the downstream server.
 	//
-	// Hop-by-hop headers are removed from the request after
-	// Director returns, which can remove headers added by
-	// Director.
-	//
-	// Unparsable query parameters are removed from the outbound
-	// request if Request.Form is set after Director returns.
-	Director func(*http.Request) error
+	// At most one of Rewrite or Director may be set.
+	Rewrite func(*ProxyRequest) error
 
 	// The transport used to perform proxy requests.
 	// If nil, http.DefaultTransport is used.
@@ -104,6 +178,10 @@ type ReverseProxy struct {
 	// If the backend is unreachable, the optional ErrorHandler is
 	// called without any call to ModifyResponse.
 	//
+	// Hop-by-hop headers are removed from the response before
+	// calling ModifyResponse. ModifyResponse may need to remove
+	// additional headers to fit its deployment model, such as Alt-Svc.
+	//
 	// If ModifyResponse returns an error, ErrorHandler is called
 	// with its error value. If ErrorHandler is nil, its default
 	// implementation is used.
@@ -115,6 +193,89 @@ type ReverseProxy struct {
 	// If nil, the default is to log the provided error and return
 	// a 502 Status Bad Gateway response.
 	ErrorHandler func(http.ResponseWriter, *http.Request, error)
+
+	// Director is deprecated. Use Rewrite instead.
+	//
+	// This function is insecure:
+	//
+	//   - Hop-by-hop headers are removed from the request after Director
+	//     returns, which can remove headers added by Director.
+	//     A client can designate headers as hop-by-hop by listing them
+	//     in the Connection header, so this permits a malicious client
+	//     to remove any headers that may be added by Director.
+	//
+	//   - X-Forwarded-For, X-Forwarded-Host, and X-Forwarded-Proto
+	//     headers in inbound requests are preserved by default,
+	//     which can permit IP spoofing if the Director function is
+	//     not careful to remove these headers.
+	//
+	// Rewrite addresses these issues.
+	//
+	// As an example of converting a Director function to Rewrite:
+	//
+	//	// ReverseProxy with a Director function.
+	//	proxy := &httputil.ReverseProxy{
+	//		Director: func(req *http.Request) {
+	//			req.URL.Scheme = "https"
+	//			req.URL.Host = proxyHost
+	//
+	//			// A malicious client can remove this header.
+	//			req.Header.Set("Some-Header", "some-header-value")
+	//
+	//			// X-Forwarded-* headers sent by the client are preserved,
+	//			// since Director did not remove them.
+	//		},
+	//	}
+	//
+	//	// ReverseProxy with a Rewrite function.
+	//	proxy := &httputil.ReverseProxy{
+	//		Rewrite: func(preq *httputil.ProxyRequest) error {
+	//			// See also ProxyRequest.SetURL.
+	//			preq.Out.URL.Scheme = "https"
+	//			preq.Out.URL.Host = proxyHost
+	//
+	//			// This header cannot be affected by a malicious client.
+	//			preq.Out.Header.Set("Some-Header", "some-header-value")
+	//
+	//			// X-Forwarded- headers sent by the client have been
+	//			// removed from preq.Out.
+	//			// ProxyRequest.SetXForwarded optionally adds new ones.
+	//			preq.SetXForwarded()
+	//			return nil
+	//		},
+	//	}
+	//
+	// Director is a function which modifies
+	// the request into a new request to be sent
+	// using Transport. Its response is then copied
+	// back to the original client unmodified.
+	// Director must not access the provided Request
+	// after returning.
+	//
+	// By default, the X-Forwarded-For header is set to the
+	// value of the client IP address. If an X-Forwarded-For
+	// header already exists, the client IP is appended to the
+	// existing values. As a special case, if the header
+	// exists in the Request.Header map but has a nil value
+	// (such as when set by the Director func), the X-Forwarded-For
+	// header is not modified.
+	//
+	// To prevent IP spoofing, be sure to delete any pre-existing
+	// X-Forwarded-For header coming from the client or
+	// an untrusted proxy.
+	//
+	// Hop-by-hop headers are removed from the request after
+	// Director returns, which can remove headers added by
+	// Director. Use a Rewrite function instead to ensure
+	// modifications to the request are preserved.
+	//
+	// Unparsable query parameters are removed from the outbound
+	// request if Request.Form is set after Director returns.
+	//
+	// At most one of Rewrite or Director may be set.
+	//
+	// Deprecated: Use Rewrite instead.
+	Director func(*http.Request) error
 
 	Deep3XX uint8
 	DenyConnUpgrade bool
@@ -174,8 +335,24 @@ func joinURLPath(a, b *url.URL) (path, rawpath string) {
 // target's path is "/base" and the incoming request was for "/dir",
 // the target request will be for /base/dir.
 // NewSingleHostReverseProxy does not rewrite the Host header.
-// To rewrite Host headers, use ReverseProxy directly with a custom
-// Director policy.
+//
+// For backwards compatibility reasons, NewSingleHostReverseProxy
+// returns a ReverseProxy using the deprecated Director function.
+// This proxy preserves X-Forwarded-* headers sent by the client.
+//
+// To customize the ReverseProxy behavior beyond what
+// NewSingleHostReverseProxy provides, use ReverseProxy directly
+// with a Rewrite function. The ProxyRequest SetURL method
+// may be used to route the outbound request. (Note that SetURL,
+// unlike NewSingleHostReverseProxy, rewrites the Host header
+// of the outbound request by default.)
+//
+//	proxy := &ReverseProxy{
+//		Rewrite: func(r *ProxyRequest) {
+//			r.SetURL(target)
+//			r.Out.Host = r.In.Host // if desired
+//		},
+//	}
 func NewSingleHostReverseProxy(target *url.URL) *ReverseProxy {
 	director := func(req *http.Request) error {
 		RewriteRequestURL(req, target)
@@ -286,6 +463,18 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		outreq.Body = nil // Issue 16036: nil Body for http.Transport retries
 	}
 	if outreq.Body != nil {
+		// Wrap the body in a reader where Close does nothing. This is done
+		// because p.Transport.RoundTrip would close the reverse proxy's
+		// outbound request body if it fails to connect to upstream. If we do
+		// not wrap the body, when we close the reverse proxy's outbound
+		// request, it will also close the reverse proxy's inbound request body
+		// (i.e. the client's outbound request body). This is because
+		// http.(*Request).Clone creates a shallow copy of the body. This can
+		// cause an infinite hang in cases where the body is not yet received
+		// from the client (e.g. 100-continue requests): Close, which
+		// internally tries to consume the body content, would be called too
+		// early and would hang.
+		outreq.Body = &noopCloseReader{readCloser: outreq.Body}
 		// Reading from the request body after returning from a handler is not
 		// allowed, and the RoundTrip goroutine that reads the Body can outlive
 		// this handler. This can lead to a crash if the handler panics (see
@@ -298,13 +487,20 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		outreq.Header = make(http.Header) // Issue 33142: historical behavior was to always allocate
 	}
 
-	var err error
-	if err = p.Director(outreq); err != nil {
-		p.getErrorHandler()(rw, req, err)
+	if (p.Director != nil) == (p.Rewrite != nil) {
+		p.getErrorHandler()(rw, req, errors.New("ReverseProxy must have exactly one of Director or Rewrite set"))
 		return
 	}
-	if outreq.Form != nil {
-		outreq.URL.RawQuery = CleanQueryParams(outreq.URL.RawQuery)
+
+	var err error
+	if p.Director != nil {
+		if err = p.Director(outreq); err != nil {
+			p.getErrorHandler()(rw, req, err)
+			return
+		}
+		if outreq.Form != nil {
+			outreq.URL.RawQuery = CleanQueryParams(outreq.URL.RawQuery)
+		}
 	}
 	outreq.Close = false
 
@@ -350,7 +546,30 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		outreq.Header.Set("Te", "trailers")
 	}
 
-	if !p.NoForwardedHeader {
+	if p.Rewrite != nil {
+		if !p.StrictRequests {
+			// Strip client-provided forwarding headers.
+			// The Rewrite func may use SetXForwarded to set new values
+			// for these or copy the previous values from the inbound request.
+			outreq.Header.Del("Forwarded")
+			outreq.Header.Del("X-Forwarded-For")
+			outreq.Header.Del("X-Forwarded-Host")
+			outreq.Header.Del("X-Forwarded-Proto")
+		}
+
+		// Remove unparsable query parameters from the outbound request.
+		outreq.URL.RawQuery = CleanQueryParams(outreq.URL.RawQuery)
+
+		pr := &ProxyRequest{
+			In:  req,
+			Out: outreq,
+		}
+		if err = p.Rewrite(pr); err != nil {
+			p.getErrorHandler()(rw, req, err)
+			return
+		}
+		outreq = pr.Out
+	} else {
 		if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
 			// If we aren't the first proxy retain prior
 			// X-Forwarded-For information as a comma+space
@@ -540,7 +759,7 @@ func shouldPanicOnCopyError(req *http.Request) bool {
 func removeHopByHopHeaders(h http.Header) {
 	// RFC 7230, section 6.1: Remove headers listed in the "Connection" header.
 	for _, f := range h["Connection"] {
-		for _, sf := range strings.Split(f, ",") {
+		for sf := range strings.SplitSeq(f, ",") {
 			if sf = textproto.TrimString(sf); sf != "" {
 				h.Del(sf)
 			}
@@ -705,6 +924,7 @@ func (p *ReverseProxy) handleUpgradeResponse(rw http.ResponseWriter, req *http.R
 	resUpType := upgradeType(res.Header)
 	if !ascii.IsPrint(resUpType) { // We know reqUpType is ASCII, it's checked by the caller.
 		p.getErrorHandler()(rw, req, fmt.Errorf("backend tried to switch to invalid protocol %q", resUpType))
+		return
 	}
 	if !ascii.EqualFold(reqUpType, resUpType) {
 		p.getErrorHandler()(rw, req, fmt.Errorf("backend tried to switch protocol %q when %q was requested", resUpType, reqUpType))
@@ -758,8 +978,16 @@ func (p *ReverseProxy) handleUpgradeResponse(rw http.ResponseWriter, req *http.R
 	spc := switchProtocolCopier{user: conn, backend: backConn}
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	<-errc
+
+	// Wait until both copy functions have sent on the error channel,
+	// or until one fails.
+	err := <-errc
+	if err == nil {
+		err = <-errc
+	}
 }
+
+var errCopyDone = errors.New("hijacked connection copy complete")
 
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
@@ -768,13 +996,33 @@ type switchProtocolCopier struct {
 }
 
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.Copy(c.user, c.backend)
-	errc <- err
+	if _, err := io.Copy(c.user, c.backend); err != nil {
+		errc <- err
+		return
+	}
+
+	// backend conn has reached EOF so propogate close write to user conn
+	if wc, ok := c.user.(interface{ CloseWrite() error }); ok {
+		errc <- wc.CloseWrite()
+		return
+	}
+
+	errc <- errCopyDone
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.Copy(c.backend, c.user)
-	errc <- err
+	if _, err := io.Copy(c.backend, c.user); err != nil {
+		errc <- err
+		return
+	}
+
+	// user conn has reached EOF so propogate close write to backend conn
+	if wc, ok := c.backend.(interface{ CloseWrite() error }); ok {
+		errc <- wc.CloseWrite()
+		return
+	}
+
+	errc <- errCopyDone
 }
 
 func CleanQueryParams(s string) string {
@@ -808,4 +1056,21 @@ func ishex(c byte) bool {
 		return true
 	}
 	return false
+}
+
+type noopCloseReader struct {
+	readCloser io.ReadCloser
+	closed     atomic.Bool
+}
+
+func (ncr *noopCloseReader) Close() error {
+	ncr.closed.Store(true)
+	return nil
+}
+
+func (ncr *noopCloseReader) Read(p []byte) (int, error) {
+	if ncr.closed.Load() {
+		return 0, errors.New("ReverseProxy does an invalid Read on closed Body")
+	}
+	return ncr.readCloser.Read(p)
 }
