@@ -70,7 +70,7 @@ type ReverseProxy struct {
 	//
 	// Unparsable query parameters are removed from the outbound
 	// request if Request.Form is set after Director returns.
-	Director func(*http.Request) bool
+	Director func(*http.Request) error
 
 	// The transport used to perform proxy requests.
 	// If nil, http.DefaultTransport is used.
@@ -177,11 +177,11 @@ func joinURLPath(a, b *url.URL) (path, rawpath string) {
 // To rewrite Host headers, use ReverseProxy directly with a custom
 // Director policy.
 func NewSingleHostReverseProxy(target *url.URL) *ReverseProxy {
-	director := func(req *http.Request) bool {
+	director := func(req *http.Request) error {
 		RewriteRequestURL(req, target)
 		// NOTE: Перед последующим изменением запроса лучше удалить из него неразбираемые параметры
 		// req.URL.RawQuery = cleanQueryParams(req.URL.RawQuery)
-		return true
+		return nil
 	}
 	return &ReverseProxy{Director: director}
 }
@@ -298,7 +298,9 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		outreq.Header = make(http.Header) // Issue 33142: historical behavior was to always allocate
 	}
 
-	if !p.Director(outreq) {
+	var err error
+	if err = p.Director(outreq); err != nil {
+		p.getErrorHandler()(rw, req, err)
 		return
 	}
 	if outreq.Form != nil {
@@ -394,10 +396,7 @@ func (p *ReverseProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	outreq = outreq.WithContext(httptrace.WithClientTrace(outreq.Context(), trace))
 
-	var (
-		res *http.Response
-		err error
-	)
+	var res *http.Response
 
 	// Follow redirects if Deep3XX > 0
 	R:
